@@ -1,0 +1,9 @@
+venv/
+.DS_Store
+__pycache__/
+*.sql
+unused/
+migrations/
+.vscode/
+data/tweets/
+alembic.ini

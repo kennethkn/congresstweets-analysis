@@ -1,0 +1,926 @@
+---
+title: "Analyzing the Tweets of U.S. Congress Members"
+author: "[Kenneth Kwan (kennethkn)](https://github.com/kennethkn/)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+GitHub Repo: https://github.com/kennethkn/congresstweets-analysis
+
+# Introduction
+
+This project aims to foster a boarder understanding of the bipartisan U.S. politics by analyzing the tweets of U.S. Congress members, including Democratic and Republican senators and representatives. The importance of it lies in the potential to reveal patterns and trends in the political discourse of recent years. Understanding these patterns can provide insights into the priorities and strategies of the two parties. Additionally, analyzing the sentiment of tweets can reveal their stance on current issues.
+
+# Data
+
+The data used in this analysis is a collection of tweets from U.S. Congress members, available on GitHub at https://github.com/alexlitel/congresstweets. Given the enormous size of the dataset (~4M entries), I have chosen a database approach to store and query the data. The database is hosted locally on my computer via PostgresSQL, but you can reproduce the database by executing Python scripts in the `scripts` folder, which holds scripts for database construction as well as text mining. For more information on how to use them, please refer to [README](https://github.com/kennethkn/congresstweets-analysis). This R Markdown document will query the database to perform the analysis and generate the plots.
+
+# Setup
+
+First, we need to load the necessary libraries and connect to the database.
+
+```{r}
+library(DBI)
+library(RPostgres)
+library(ggplot2)
+library(tidytext)
+library(ggpattern)
+```
+
+```{r}
+readRenviron(".env")
+DATABASE_URL <- Sys.getenv("DATABASE_URL")
+
+url_parts <- unlist(strsplit(DATABASE_URL, "://|@|:|/"))
+
+driver <- url_parts[1]
+user <- url_parts[2]
+host <- url_parts[3]
+port <- url_parts[4]
+dbname <- url_parts[5]
+
+con <- dbConnect(RPostgres::Postgres(), dbname = dbname, host = host, port = port, user = user)
+```
+
+```{r}
+D_HEX <- "#00AEF3"
+R_HEX <- "#E81B23"
+NA_HEX <- "grey"
+
+HOUSE_HEX <- "#F8766D"
+SENATE_HEX <- "#00BFC4"
+```
+
+# Data Exploration
+
+Let's start by exploring the structure of the database.
+
+```{r}
+# List tables
+dbListTables(con)
+```
+
+```{r}
+# Row count and column names for "tweets" table
+dbGetQuery(con, "SELECT COUNT(*) FROM tweets")
+dbGetQuery(con, "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'tweets'")
+```
+
+```{r}
+# Row count and column names for "members" table
+dbGetQuery(con, "SELECT COUNT(*) FROM members")
+dbGetQuery(con, "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'members'")
+```
+
+```{r}
+# Row count and column names for "accounts" table
+dbGetQuery(con, "SELECT COUNT(*) FROM accounts")
+dbGetQuery(con, "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'accounts'")
+```
+
+Now, let's take a look at the first few rows of each table.
+
+```{r}
+dbGetQuery(con, "SELECT * FROM tweets LIMIT 6")
+dbGetQuery(con, "SELECT * FROM members LIMIT 6")
+dbGetQuery(con, "SELECT * FROM accounts LIMIT 6")
+```
+
+We can join the tables to get more information about the authors of the tweets.
+
+```{r}
+dbGetQuery(con, "SELECT * FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id LIMIT 6")
+```
+
+What is the time range of the tweets?
+
+```{r}
+dbGetQuery(con, "SELECT MIN(time), MAX(time) FROM tweets")
+```
+
+We have tweets from June 2017 to July 2023. Since the data for 2017 and 2023 are incomplete, we will focus on the period from 2018 to 2022 for any time series analysis, which includes the 2nd session of the 115th Congress to the 1st session of the 117th Congress.
+
+> For reference:
+> 115th Congress (2017-2019): Republican majority in both chambers
+> 116th Congress (2019-2021): Democratic majority in the House, Republican majority in the Senate
+> 117th Congress (2021-2023): Democratic majority in both chambers
+
+Let's also find out the possible values for categorical columns.
+
+```{r}
+dbGetQuery(con, "SELECT DISTINCT chamber FROM members")
+dbGetQuery(con, "SELECT DISTINCT party FROM members")
+dbGetQuery(con, "SELECT DISTINCT account_type FROM accounts")
+```
+
+How many tweets are we dealing with?
+
+```{r}
+dbGetQuery(con, "SELECT COUNT(*) FROM tweets")
+```
+
+There are a total of 4,310,843 tweets posted by U.S. Congress members from June 2017 to July 2023.
+
+# Data Analysis
+
+Table of Contents:
+
+1. [Tweet Count by Party and Year](#tweet-count-by-party-and-year)
+2. [Tweet Count by Chamber and Year](#tweet-count-by-chamber-and-year)
+3. [Top Tweeters by Year](#top-tweeters-by-year)
+4. [Top Hashtags](#top-hashtags)
+5. [Top Hashtags by Party](#top-hashtags-by-party)
+6. [Top Hashtags by Party and Year](#top-hashtags-by-party-and-year)
+7. [Top Hashtags by Chamber](#top-hashtags-by-chamber)
+8. [Top Words](#top-words)
+9. [Top Words by Party](#top-words-by-party)
+10. [Top Words by Party and Year](#top-words-by-party-and-year)
+11. [Top Words by Chamber](#top-words-by-chamber)
+12. [Sentiment Analysis by Party and Year](#sentiment-analysis-by-party-and-year)
+13. [Sentiment Analysis by Chamber and Year](#sentiment-analysis-by-chamber-and-year)
+14. [Sentiment Analysis by Topic and Party](#sentiment-analysis-by-topic-and-party)
+15. [Top Accounts Retweeted](#top-accounts-retweeted)
+16. [Top Accounts Retweeted by Party](#top-accounts-retweeted-by-party)
+17. [Top Accounts Quoted](#top-accounts-quoted)
+18. [Top Accounts Quoted by Party](#top-accounts-quoted-by-party)
+19. [Top Accounts Mentioned](#top-accounts-mentioned)
+20. [Top Accounts Mentioned by Party](#top-accounts-mentioned-by-party)
+
+## Tweet Count by Party and Year
+
+Let's start by counting the number of tweets by party affiliation of the tweet author.
+
+```{r}
+tweet_count_by_party <- dbGetQuery(con, "SELECT party, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id GROUP BY party")
+tweet_count_by_party$percentage <- tweet_count_by_party$count / sum(tweet_count_by_party$count) * 100
+```
+
+```{r,fig.width=10}
+tweet_count_by_party
+pie(tweet_count_by_party$count, labels = paste0(c("Democratic Party", "Republican Party", "Independent"), " (", round(tweet_count_by_party$percentage, 2), "%)"), main = "Tweets of U.S. Congress Members, by Party of Tweet Author, 2017-2023", col = c(D_HEX, R_HEX, NA_HEX))
+```
+
+Democratic Congress members have tweeted the most from 2017 to 2023, accounting for nearly 60% of all tweets, followed by Republican members at around 40%. Independent members have tweeted the least at less than 1%.
+
+Now let's see how the number of tweets has evolved over time.
+
+```{r}
+tweet_count_by_party_2018 <- dbGetQuery(con, "SELECT party, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2018-01-01' AND time < '2019-01-01' GROUP BY party")
+tweet_count_by_party_2019 <- dbGetQuery(con, "SELECT party, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2019-01-01' AND time < '2020-01-01' GROUP BY party")
+tweet_count_by_party_2020 <- dbGetQuery(con, "SELECT party, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2020-01-01' AND time < '2021-01-01' GROUP BY party")
+tweet_count_by_party_2021 <- dbGetQuery(con, "SELECT party, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2021-01-01' AND time < '2022-01-01' GROUP BY party")
+tweet_count_by_party_2022 <- dbGetQuery(con, "SELECT party, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2022-01-01' AND time < '2023-01-01' GROUP BY party")
+tweet_count_by_party_2018$year <- 2018
+tweet_count_by_party_2019$year <- 2019
+tweet_count_by_party_2020$year <- 2020
+tweet_count_by_party_2021$year <- 2021
+tweet_count_by_party_2022$year <- 2022
+tweet_count_by_party_ts <- rbind(tweet_count_by_party_2018, tweet_count_by_party_2019, tweet_count_by_party_2020, tweet_count_by_party_2021, tweet_count_by_party_2022)
+
+tweet_count_ts <- aggregate(count ~ year, tweet_count_by_party_ts, sum)
+```
+
+```{r,fig.width=10}
+tweet_count_ts
+tweet_count_by_party_ts
+
+ggplot(tweet_count_ts, aes(x = year, y = count)) +
+  geom_point() +
+  geom_line() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Tweets of U.S. Congress Members, by Year, 2018-2022", x = "Year", y = "Number of Tweets") +
+  theme_minimal()
+
+ggplot(tweet_count_by_party_ts, aes(x = year, y = count, fill = party)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c(D_HEX, R_HEX, NA_HEX), labels = c("Democratic", "Republican", "Independent")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Tweets of U.S. Congress Members, by Party of Tweet Author and Year, 2018-2022", x = "Year", y = "Number of Tweets", fill = "Party") +
+  theme_minimal()
+```
+
+The line plot shows the number of tweets peaked in 2020, aka election year, following progressive growth from 2018. Notably, it did not fall back to 2018 levels after the election, suggesting that the members have continued to use X as a platform to communicate with the public after enthusiasm from the election.
+
+The bar plot shows that the Democratic members have tweeted more than the Republican members in each year. Interestingly, the number of tweets from Republican members sustained at a significantly higher level than in 2018 following an abrupt increase in 2020, while the same cannot be said for the Democratic members, suggesting that the Republican members are the main drivers of the overall increase in the number of tweets after the election.
+
+## Tweet Count by Chamber and Year
+
+Next, we do the same, but by chamber of the tweet author.
+
+```{r}
+tweet_count_by_chamber <- dbGetQuery(con, "SELECT chamber, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id GROUP BY chamber")
+tweet_count_by_chamber$per_seat_rate <- tweet_count_by_chamber$count / ifelse(tweet_count_by_chamber$chamber == "house", 435, 100)
+tweet_count_by_chamber$percentage <- tweet_count_by_chamber$per_seat_rate / sum(tweet_count_by_chamber$per_seat_rate) * 100
+```
+
+```{r,fig.width=10}
+tweet_count_by_chamber
+pie(tweet_count_by_chamber$per_seat_rate, labels = paste0(c("House", "Senate"), " (", round(tweet_count_by_chamber$percentage, 2), "%)"), main = "Tweets of U.S. Congress Members, by Chamber of Tweet Author, 2017-2023", col = c(HOUSE_HEX, SENATE_HEX))
+title(sub = "Note: Per-seat figures are used to account for the difference in the number of seats between the House and the Senate")
+```
+
+Members of the Senate have tweeted more than members of the House on a per-seat basis by around 15%, indicating that Senate members are on average more active on Twitter than House members.
+
+```{r}
+tweet_count_by_chamber_2018 <- dbGetQuery(con, "SELECT chamber, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2018-01-01' AND time < '2019-01-01' GROUP BY chamber")
+tweet_count_by_chamber_2019 <- dbGetQuery(con, "SELECT chamber, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2019-01-01' AND time < '2020-01-01' GROUP BY chamber")
+tweet_count_by_chamber_2020 <- dbGetQuery(con, "SELECT chamber, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2020-01-01' AND time < '2021-01-01' GROUP BY chamber")
+tweet_count_by_chamber_2021 <- dbGetQuery(con, "SELECT chamber, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2021-01-01' AND time < '2022-01-01' GROUP BY chamber")
+tweet_count_by_chamber_2022 <- dbGetQuery(con, "SELECT chamber, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2022-01-01' AND time < '2023-01-01' GROUP BY chamber")
+tweet_count_by_chamber_2018$year <- 2018
+tweet_count_by_chamber_2019$year <- 2019
+tweet_count_by_chamber_2020$year <- 2020
+tweet_count_by_chamber_2021$year <- 2021
+tweet_count_by_chamber_2022$year <- 2022
+tweet_count_by_chamber_ts <- rbind(tweet_count_by_chamber_2018, tweet_count_by_chamber_2019, tweet_count_by_chamber_2020, tweet_count_by_chamber_2021, tweet_count_by_chamber_2022)
+tweet_count_by_chamber_ts$per_seat_rate <- tweet_count_by_chamber_ts$count / ifelse(tweet_count_by_chamber_ts$chamber == "house", 435, 100)
+```
+
+```{r,fig.width=10}
+tweet_count_by_chamber_ts
+
+ggplot(tweet_count_by_chamber_ts, aes(x = year, y = per_seat_rate, fill = chamber)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c(HOUSE_HEX, SENATE_HEX), labels = c("House", "Senate")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Tweets of U.S. Congress Members, by Chamber of Tweet Author and Year, 2018-2022", x = "Year", y = "Number of Tweets per Seat", fill = "Chamber", subtitle = "Note: Per-seat figures are used to account for the difference in the number of seats between the House and the Senate") +
+  theme_minimal()
+```
+
+Members of the Senate has tweeted more than members of the House on a per-seat basis in each year, which is consistent with the previous observation. The number of tweets from both chambers peaked in 2020, but the increase was more pronounced in the Senate, suggesting that the Senate members showed more enthusiasm in using X as a platform to communicate with the public during the election.
+
+## Top Tweeters by Year
+
+Moving on, let's see some names. Who are the top tweeters in each year?
+
+```{r}
+tweet_count_max_2018 <- dbGetQuery(con, "SELECT name, chamber, party, account_type, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2018-01-01' AND time < '2019-01-01' GROUP BY name, chamber, party, account_type ORDER BY count DESC LIMIT 10")
+tweet_count_max_2019 <- dbGetQuery(con, "SELECT name, chamber, party, account_type, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2019-01-01' AND time < '2020-01-01' GROUP BY name, chamber, party, account_type ORDER BY count DESC LIMIT 10")
+tweet_count_max_2020 <- dbGetQuery(con, "SELECT name, chamber, party, account_type, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2020-01-01' AND time < '2021-01-01' GROUP BY name, chamber, party, account_type ORDER BY count DESC LIMIT 10")
+tweet_count_max_2021 <- dbGetQuery(con, "SELECT name, chamber, party, account_type, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2021-01-01' AND time < '2022-01-01' GROUP BY name, chamber, party, account_type ORDER BY count DESC LIMIT 10")
+tweet_count_max_2022 <- dbGetQuery(con, "SELECT name, chamber, party, account_type, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2022-01-01' AND time < '2023-01-01' GROUP BY name, chamber, party, account_type ORDER BY count DESC LIMIT 10")
+tweet_count_max_2018$year <- 2018
+tweet_count_max_2019$year <- 2019
+tweet_count_max_2020$year <- 2020
+tweet_count_max_2021$year <- 2021
+tweet_count_max_2022$year <- 2022
+tweet_count_max_ts <- rbind(tweet_count_max_2018, tweet_count_max_2019, tweet_count_max_2020, tweet_count_max_2021, tweet_count_max_2022)
+```
+
+```{r,fig.width=10}
+tweet_count_max_ts
+ggplot(tweet_count_max_ts, aes(x = count, y = reorder_within(name, count, year))) +
+  geom_col(aes(fill = party)) +
+  geom_col_pattern(aes(pattern = chamber), pattern_key_scale_factor = 0.5, fill = NA, color = "white", pattern_color = "white") +
+  facet_wrap(~year, scales = "free_y") +
+  labs(title = "Top 10 Congress Members with the Most Tweets, by Year", x = "Number of Tweets", y = "Congress Member", fill = "Party", pattern = "Chamber") +
+  scale_fill_manual(values = c(D_HEX, R_HEX, NA_HEX), labels = c("Democratic", "Republican", "Independent")) +
+  scale_pattern_manual(values = c("stripe", "crosshatch"), labels = c("House", "Senate")) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_reordered(labels = function(x) gsub("___\\d{4}", "", x)) +
+  theme_minimal()
+```
+
+The top tweeters are evenly distributed between the two parties, with representation from both chambers that are consistent with the ratio of seats. We can see that the top tweeters are largely the same in each year, suggesting that some Congress members are consistently using X as a major platform to communicate with the public or deliver campaign messages, such as Rep. Billy Long (R), Rep. Don Beyer (D), Sen. John Cornyn (R). Notably, Texas senator Ted Cruz (R) appeared in the list in 2020 and has stayed in the top 10 since.
+
+## Top Hashtags
+
+```{r}
+hashtags_top_30 <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets) AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 30")
+hashtags_top_30$rank <- rank(-hashtags_top_30$count)
+```
+
+```{r,fig.width=10}
+hashtags_top_30
+ggplot(hashtags_top_30, aes(x = count, y = reorder(hashtag, count))) +
+  geom_col() +
+  geom_text(aes(label = paste0("#", rank)), hjust = -0.3) +
+  labs(title = "Top 30 Most Common Hashtags Used by Congress Members in Tweets, 2017-2023", x = "Number of Tweets", y = "Hashtag") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+The most common hashtag used by Congress members is “#COVID19”, followed by “#ForThePeople” and “#SOTU”. COVID-19 was a major event that affected the world in 2020 and 2021, so it is not surprising that it was the most common hashtag used by Congress members. The hashtag “#ForThePeople” is related to the Democratic Party's slogan for the 2020 election, while “#SOTU” is related to the annual State of the Union address by the President. Overall, hashtags used by Democratic members seem to be more prevalent than those used by Republican members in the top 30.
+
+## Top Hashtags by Party
+
+Let's also analyze with respect to party.
+
+```{r}
+hashtags_top_30_d <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 30")
+hashtags_top_30_r <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 30")
+hashtags_top_30_d$party <- "Democratic Party"
+hashtags_top_30_d$rank <- rank(-hashtags_top_30_d$count)
+hashtags_top_30_r$party <- "Republican Party"
+hashtags_top_30_r$rank <- rank(-hashtags_top_30_r$count)
+hashtags_top_30_by_party <- rbind(hashtags_top_30_d, hashtags_top_30_r)
+```
+
+```{r,fig.width=10}
+hashtags_top_30_by_party
+ggplot(hashtags_top_30_by_party, aes(x = count, y = reorder_within(hashtag, -rank, party))) +
+  geom_col(aes(fill = party)) +
+  geom_text(aes(label = paste0("#", rank)), hjust = c(1.3, rep(-0.3, 29), 1.3, rep(-0.3, 29))) +
+  facet_wrap(~party, scales = "free") +
+  labs(title = "Top 30 Most Common Hashtags Used by Congress Members in Tweets, by Party, 2017-2023", x = "Number of Tweets", y = "Hashtag") +
+  scale_fill_manual(values = c(D_HEX, R_HEX)) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_reordered(labels = function(x) gsub("___.*", "", x)) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The hashtags reveal the priorities and strategies of the two parties. While both parties have used platform slogans as hashtags, such as “#ForThePeople” and "#BuildBackBetter" by Democrats and "#MAGA" and "#StandUpForAmerica" by Republicans, their other hashtags often relate to their stance on current issues. For example, Democrats have used hashtags related to healthcare, climate change, and gun control, while Republicans have used hashtags related to the border, tax cuts, and the economy.
+
+It is also interesting to note the difference in strategies between the two parties, with Democrats primarily using catchy slogans as hashtags, while Republicans uses hashtags that are more vague and open to interpretation. For example, looking at hashtags by democratic members, most of them are "#EndGunViolence", "#NetNeutrality", "#ChildTaxCredit", "#BlackHistoryMonth", "#GetCovered", and more. These hashtags strongly hint at the party's policy goals and stance on issues. Meanwhile, looking at hashtags by republican members, a lot of them are "#China", "#Ohio", "#Cuba", "#NY21", etc, which are meaningless without context. This suggests that Republicans are using hashtags more as a way to draw attention to specific events rather than to promote their policy goals.
+
+## Top Hashtags by Party and Year
+
+Let's consider time as well.
+
+```{r}
+hashtags_top_10_d_2018 <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2018-01-01' AND time < '2019-01-01') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 10")
+hashtags_top_10_r_2018 <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2018-01-01' AND time < '2019-01-01') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 10")
+hashtags_top_10_d_2019 <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2019-01-01' AND time < '2020-01-01') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 10")
+hashtags_top_10_r_2019 <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2019-01-01' AND time < '2020-01-01') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 10")
+hashtags_top_10_d_2020 <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2020-01-01' AND time < '2021-01-01') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 10")
+hashtags_top_10_r_2020 <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2020-01-01' AND time < '2021-01-01') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 10")
+hashtags_top_10_d_2021 <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2021-01-01' AND time < '2022-01-01') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 10")
+hashtags_top_10_r_2021 <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2021-01-01' AND time < '2022-01-01') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 10")
+hashtags_top_10_d_2022 <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2022-01-01' AND time < '2023-01-01') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 10")
+hashtags_top_10_r_2022 <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2022-01-01' AND time < '2023-01-01') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 10")
+hashtags_top_10_d_2018$year <- 2018
+hashtags_top_10_r_2018$year <- 2018
+hashtags_top_10_d_2019$year <- 2019
+hashtags_top_10_r_2019$year <- 2019
+hashtags_top_10_d_2020$year <- 2020
+hashtags_top_10_r_2020$year <- 2020
+hashtags_top_10_d_2021$year <- 2021
+hashtags_top_10_r_2021$year <- 2021
+hashtags_top_10_d_2022$year <- 2022
+hashtags_top_10_r_2022$year <- 2022
+hashtags_top_10_d_2018$party <- "D"
+hashtags_top_10_r_2018$party <- "R"
+hashtags_top_10_d_2019$party <- "D"
+hashtags_top_10_r_2019$party <- "R"
+hashtags_top_10_d_2020$party <- "D"
+hashtags_top_10_r_2020$party <- "R"
+hashtags_top_10_d_2021$party <- "D"
+hashtags_top_10_r_2021$party <- "R"
+hashtags_top_10_d_2022$party <- "D"
+hashtags_top_10_r_2022$party <- "R"
+hashtags_top_10_by_party_and_year <- rbind(hashtags_top_10_d_2018, hashtags_top_10_r_2018, hashtags_top_10_d_2019, hashtags_top_10_r_2019, hashtags_top_10_d_2020, hashtags_top_10_r_2020, hashtags_top_10_d_2021, hashtags_top_10_r_2021, hashtags_top_10_d_2022, hashtags_top_10_r_2022)
+```
+
+```{r,fig.width=17,fig.height=5}
+library(ggh4x)
+hashtags_top_10_by_party_and_year
+ggplot(hashtags_top_10_by_party_and_year, aes(x = count, y = reorder_within(hashtag, count, interaction(year, party)), fill = party)) +
+  geom_col() +
+  facet_grid2(party ~ year, scales = "free", independent = "y", labeller = as_labeller(c("D" = "Democratic Party", "R" = "Republican Party", "2018" = "2018", "2019" = "2019", "2020" = "2020", "2021" = "2021", "2022" = "2022"))) +
+  labs(title = "Top 10 Most Common Hashtags Used by Congress Members in Tweets, by Party and Year, 2018-2022", x = "Number of Tweets", y = "Hashtag", fill = "Party") +
+  scale_fill_manual(values = c(D_HEX, R_HEX)) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_reordered(labels = function(x) gsub("___\\d{4}\\.(D|R)", "", x)) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+In 2018 and 2019, The Democratic members have used hashtags to criticize the Trump administration and promote their policies regarding healthcare, equality and climate change, while the Republican members have used hashtags to support Trump and promote their policies regarding tax reform and the border in the same period.
+
+In 2020, both parties have used hashtags related to the COVID-19 pandemic and the election, but the Democratic members have also used hashtags to raise awareness about social justice issues, particularly the Black Lives Matter movement, while the Republican members have used hashtags about the economy.
+
+In 2021, the Democratic members supported the Biden administration's policy regarding the pandemic and economy, and continued support on social justice issues, while the Republican members have shifted focus on the border and international developments, such as the esclations in Cuba and Afghanistan.
+
+In 2022, the Democratic members have used hashtags regarding gun violence, cancelling student debt, as well as continued support on social justice issues, while the Republican members have used hashtags regarding the border, the economy, and the situation in Ukraine.
+
+## Top Hashtag by Chamber
+
+Let's also analyze with respect to chamber.
+
+```{r}
+hashtags_top_30_h <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE chamber = 'house') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 30")
+hashtags_top_30_s <- dbGetQuery(con, "SELECT hashtag, COUNT(*) FROM (SELECT unnest(hashtags) AS hashtag FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE chamber = 'senate') AS hashtags GROUP BY hashtag ORDER BY count DESC LIMIT 30")
+hashtags_top_30_h$chamber <- "House of Representatives"
+hashtags_top_30_h$rank <- rank(-hashtags_top_30_h$count)
+hashtags_top_30_s$chamber <- "Senate"
+hashtags_top_30_s$rank <- rank(-hashtags_top_30_s$count)
+hashtags_top_30_by_chamber <- rbind(hashtags_top_30_h, hashtags_top_30_s)
+```
+
+```{r,fig.width=10}
+hashtags_top_30_by_chamber
+ggplot(hashtags_top_30_by_chamber, aes(x = count, y = reorder_within(hashtag, -rank, chamber))) +
+  geom_col(aes(fill = chamber)) +
+  geom_text(aes(label = paste0("#", rank)), hjust = c(1.3, rep(-0.3, 29), 1.3, rep(-0.3, 29))) +
+  facet_wrap(~chamber, scales = "free") +
+  labs(title = "Top 30 Most Common Hashtags Used by Congress Members in Tweets, by Chamber, 2017-2023", x = "Number of Tweets", y = "Hashtag") +
+  scale_fill_manual(values = c(HOUSE_HEX, SENATE_HEX)) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_reordered(labels = function(x) gsub("___.*", "", x)) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Top Words
+
+Next, we will analyze the most common words used by Congress members in their tweets.
+
+```{r}
+# >>> ACTION REQUIRED: Please uncomment the following line and remove the workaround below
+# tokens_top_30 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets) AS tokens GROUP BY word ORDER BY count DESC LIMIT 30")
+
+# Workaround for a bug in process_text.py. I've fixed it so you won't need this anymore. You can safely remove this workaround, but you need to uncomment the code above.
+library(dplyr)
+tokens_top_30 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets) AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(30)
+# End of workaround
+
+tokens_top_30$rank <- rank(-tokens_top_30$count)
+```
+
+```{r,fig.width=10}
+tokens_top_30
+ggplot(tokens_top_30, aes(x = count, y = reorder(word, count))) +
+  geom_col() +
+  geom_text(aes(label = paste0("#", rank)), hjust = -0.3) +
+  labs(title = "Top 30 Most Common Words Used by Congress Members in Tweets, 2017-2023", x = "Number of Occurrences", y = "Word") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+The most common words used by Congress members in their tweets are “people”, "trump", "act", "president", "american", and etc. These words are general and do not provide much insight into the content of the tweets. However, we can see that the word "trump" is one of the most common, which suggests that the former president Donald Trump was a major topic of discussion among Congress members during his time in office.
+
+## Top Words by Party
+
+Let's also analyze with respect to party.
+
+```{r}
+# >>> ACTION REQUIRED: Please uncomment the following lines and remove the workaround below
+# tokens_top_30_d <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D') AS tokens GROUP BY word ORDER BY count DESC LIMIT 30")
+# tokens_top_30_r <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R') AS tokens GROUP BY word ORDER BY count DESC LIMIT 30")
+
+# Workaround for a bug in process_text.py. I've fixed it so you won't need this anymore. You can safely remove this workaround, but you need to uncomment the code above.
+tokens_top_30_d <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(30)
+tokens_top_30_r <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(30)
+# End of workaround
+
+tokens_top_30_d$party <- "Democratic Party"
+tokens_top_30_d$rank <- rank(-tokens_top_30_d$count)
+tokens_top_30_r$party <- "Republican Party"
+tokens_top_30_r$rank <- rank(-tokens_top_30_r$count)
+tokens_top_30_by_party <- rbind(tokens_top_30_d, tokens_top_30_r)
+```
+
+```{r,fig.width=10}
+tokens_top_30_by_party
+ggplot(tokens_top_30_by_party, aes(x = count, y = reorder_within(word, count, party))) +
+  geom_col(aes(fill = party)) +
+  geom_text(aes(label = paste0("#", rank)), hjust = c(1.3, rep(-0.3, 29), 1.3, rep(-0.3, 29))) +
+  facet_wrap(~party, scales = "free") +
+  labs(title = "Top 30 Most Common Words Used by Congress Members in Tweets, by Party, 2017-2023", x = "Number of Occurrences", y = "Word") +
+  scale_fill_manual(values = c(D_HEX, R_HEX)) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_reordered(labels = function(x) gsub("___.*", "", x)) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The most common words used by Democratic members in their tweets are “trump", "people", "act", "health", "president", and etc. Notably ones down the list are "women", "community/communities", "protect", "fight", "public", and "rights". These words suggest that Democratic members discussed majorly about the former president Donald Trump, as well as current issues such as healthcare and rights of women and other communities.
+
+On the other hand, the most common words used by Republican members in their tweets are “biden", "american", "president", "people", "house", and etc. Again, noteworthy ones down the list are "border", "democrats", "nation", "national", "trump", "tax", "law", "energy", and "crisis". These words suggest that Republican members discussed majorly about the current president Joe Biden, as well as current issues such as border security, energy policy, and tax law. Moreover, the word "trump" is still present in the list, indicating that the former president Donald Trump was still a major topic of discussion among Republican members.
+
+It is surprising that gun control, climate change, and other major current issues which are present in the list of top hashtags, are not present in the list of top words. This suggests that Congress members are relying more on hashtags to convey their stance on these issues, rather than addressing them directly in their tweets.
+
+# Top Words by Party and Year
+
+Let's also analyze with respect to party and year.
+
+```{r}
+# >>> ACTION REQUIRED: Please uncomment the following lines and remove the workaround below
+# tokens_top_10_d_2018 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2018-01-01' AND time < '2019-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 10")
+# tokens_top_10_r_2018 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2018-01-01' AND time < '2019-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 10")
+# tokens_top_10_d_2019 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2019-01-01' AND time < '2020-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 10")
+# tokens_top_10_r_2019 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2019-01-01' AND time < '2020-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 10")
+# tokens_top_10_d_2020 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2020-01-01' AND time < '2021-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 10")
+# tokens_top_10_r_2020 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2020-01-01' AND time < '2021-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 10")
+# tokens_top_10_d_2021 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2021-01-01' AND time < '2022-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 10")
+# tokens_top_10_r_2021 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2021-01-01' AND time < '2022-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 10")
+# tokens_top_10_d_2022 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2022-01-01' AND time < '2023-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 10")
+# tokens_top_10_r_2022 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2022-01-01' AND time < '2023-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 10")
+
+# Workaround for a bug in process_text.py. I've fixed it so you won't need this anymore. You can safely remove this workaround, but you need to uncomment the code above.
+tokens_top_10_d_2018 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2018-01-01' AND time < '2019-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(10)
+tokens_top_10_r_2018 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2018-01-01' AND time < '2019-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(10)
+tokens_top_10_d_2019 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2019-01-01' AND time < '2020-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(10)
+tokens_top_10_r_2019 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2019-01-01' AND time < '2020-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(10)
+tokens_top_10_d_2020 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2020-01-01' AND time < '2021-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(10)
+tokens_top_10_r_2020 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2020-01-01' AND time < '2021-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(10)
+tokens_top_10_d_2021 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2021-01-01' AND time < '2022-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(10)
+tokens_top_10_r_2021 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2021-01-01' AND time < '2022-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(10)
+tokens_top_10_d_2022 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND time >= '2022-01-01' AND time < '2023-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(10)
+tokens_top_10_r_2022 <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND time >= '2022-01-01' AND time < '2023-01-01') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(10)
+# End of workaround
+
+tokens_top_10_d_2018$year <- 2018
+tokens_top_10_r_2018$year <- 2018
+tokens_top_10_d_2019$year <- 2019
+tokens_top_10_r_2019$year <- 2019
+tokens_top_10_d_2020$year <- 2020
+tokens_top_10_r_2020$year <- 2020
+tokens_top_10_d_2021$year <- 2021
+tokens_top_10_r_2021$year <- 2021
+tokens_top_10_d_2022$year <- 2022
+tokens_top_10_r_2022$year <- 2022
+tokens_top_10_d_2018$party <- "D"
+tokens_top_10_r_2018$party <- "R"
+tokens_top_10_d_2019$party <- "D"
+tokens_top_10_r_2019$party <- "R"
+tokens_top_10_d_2020$party <- "D"
+tokens_top_10_r_2020$party <- "R"
+tokens_top_10_d_2021$party <- "D"
+tokens_top_10_r_2021$party <- "R"
+tokens_top_10_d_2022$party <- "D"
+tokens_top_10_r_2022$party <- "R"
+tokens_top_10_by_party_and_year <- rbind(tokens_top_10_d_2018, tokens_top_10_r_2018, tokens_top_10_d_2019, tokens_top_10_r_2019, tokens_top_10_d_2020, tokens_top_10_r_2020, tokens_top_10_d_2021, tokens_top_10_r_2021, tokens_top_10_d_2022, tokens_top_10_r_2022)
+```
+
+```{r,fig.width=17,fig.height=5}
+tokens_top_10_by_party_and_year
+ggplot(tokens_top_10_by_party_and_year, aes(x = count, y = reorder_within(word, count, interaction(year, party)), fill = party)) +
+  geom_col() +
+  facet_grid2(party ~ year, scales = "free", independent = "y", labeller = as_labeller(c("D" = "Democratic Party", "R" = "Republican Party", "2018" = "2018", "2019" = "2019", "2020" = "2020", "2021" = "2021", "2022" = "2022"))) +
+  labs(title = "Top 10 Most Common Words Used by Congress Members in Tweets, by Party and Year, 2018-2022", x = "Number of Occurrences", y = "Word", fill = "Party") +
+  scale_fill_manual(values = c(D_HEX, R_HEX)) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_reordered(labels = function(x) gsub("___\\d{4}\\.(D|R)", "", x)) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+"Trump" was the top word for Democratic members during the Trump administration, while "Biden" was the top word for Republican members during the Biden administration, suggesting the opposing party like to mention the ruling president in their tweets.
+
+Democratic members' usage of words have been consistent over the years, focusing on healthcare. On the other hand, Republican members' usage of words have evolved, likely reacting to developments in various issues. For example, the popularity of the word "border" went from outside the top 10 in 2018 to the top 2 in 2022. There are also introduction of new words in the top 10 since the Biden administration, such as "inflation" and "energy", suggesting that Republican members are criticizing the Biden administration's policies on these issues.
+
+# Top Words by Chamber
+
+Let's also analyze with respect to chamber.
+
+```{r}
+# >>> ACTION REQUIRED: Please uncomment the following lines and remove the workaround below
+# tokens_top_30_h <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE chamber = 'house') AS tokens GROUP BY word ORDER BY count DESC LIMIT 30")
+# tokens_top_30_s <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE chamber = 'senate') AS tokens GROUP BY word ORDER BY count DESC LIMIT 30")
+
+# Workaround for a bug in process_text.py. I've fixed it so you won't need this anymore. You can safely remove this workaround, but you need to uncomment the code above.
+tokens_top_30_h <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE chamber = 'house') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(30)
+tokens_top_30_s <- dbGetQuery(con, "SELECT word, COUNT(*) FROM (SELECT unnest(tokens) AS word FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE chamber = 'senate') AS tokens GROUP BY word ORDER BY count DESC LIMIT 100") |>
+  anti_join(stop_words, by = "word") |>
+  head(30)
+# End of workaround
+
+tokens_top_30_h$chamber <- "House of Representatives"
+tokens_top_30_h$rank <- rank(-tokens_top_30_h$count)
+tokens_top_30_s$chamber <- "Senate"
+tokens_top_30_s$rank <- rank(-tokens_top_30_s$count)
+tokens_top_30_by_chamber <- rbind(tokens_top_30_h, tokens_top_30_s)
+```
+
+```{r,fig.width=10}
+tokens_top_30_by_chamber
+ggplot(tokens_top_30_by_chamber, aes(x = count, y = reorder_within(word, count, chamber))) +
+  geom_col(aes(fill = chamber)) +
+  geom_text(aes(label = paste0("#", rank)), hjust = c(1.3, rep(-0.3, 29), 1.3, rep(-0.3, 29))) +
+  facet_wrap(~chamber, scales = "free") +
+  labs(title = "Top 30 Most Common Words Used by Congress Members in Tweets, by Chamber, 2017-2023", x = "Number of Occurrences", y = "Word") +
+  scale_fill_manual(values = c(HOUSE_HEX, SENATE_HEX)) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_reordered(labels = function(x) gsub("___.*", "", x)) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The most common words are mostly the same with the previous analysis that is by party. However, one particular word that stands out is "bipartisan" in the list of top words used by Senate members. This suggests that Senate members are more likely to discuss bipartisan issues and cooperation in their tweets compared to House members.
+
+## Sentiment Analysis by Party and Year
+
+Let's proceed to the analysis of tweet content. As mentioned, text mining is completed in Python beforehand. We can now retrieve the result from the database.
+
+First, we will analyze the sentiment of tweets by party affiliation of the author.
+
+```{r}
+sentiment_by_party <- dbGetQuery(con, "SELECT party, AVG(sentiment_score) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id GROUP BY party")
+```
+
+```{r,fig.width=10}
+sentiment_by_party
+ggplot(sentiment_by_party, aes(x = party, y = avg)) +
+  geom_col(fill = c(D_HEX, R_HEX, NA_HEX)) +
+  labs(title = "Average Sentiment of Tweets of U.S. Congress Members, by Party, 2017-2023", x = "Party", y = "Average Sentiment Score") +
+  scale_x_discrete(labels = c("Democratic", "Republican", "Independent")) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+The order of the average sentiment scores from highest to lowest is independent, Democratic, and Republican. This indicates that independent members have the most positive sentiment in their tweets, followed by Democratic members, and then Republican members. However, the difference in sentiment scores between the three parties is not significant, so we can only conclude that the sentiment of tweets of Congress members is generally positive.
+
+Let's see if the sentiment of tweets has changed over time.
+
+```{r}
+sentiment_by_party_2018 <- dbGetQuery(con, "SELECT party, AVG(sentiment_score) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2018-01-01' AND time < '2019-01-01' GROUP BY party")
+sentiment_by_party_2019 <- dbGetQuery(con, "SELECT party, AVG(sentiment_score) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2019-01-01' AND time < '2020-01-01' GROUP BY party")
+sentiment_by_party_2020 <- dbGetQuery(con, "SELECT party, AVG(sentiment_score) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2020-01-01' AND time < '2021-01-01' GROUP BY party")
+sentiment_by_party_2021 <- dbGetQuery(con, "SELECT party, AVG(sentiment_score) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2021-01-01' AND time < '2022-01-01' GROUP BY party")
+sentiment_by_party_2022 <- dbGetQuery(con, "SELECT party, AVG(sentiment_score) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2022-01-01' AND time < '2023-01-01' GROUP BY party")
+sentiment_by_party_2018$year <- 2018
+sentiment_by_party_2019$year <- 2019
+sentiment_by_party_2020$year <- 2020
+sentiment_by_party_2021$year <- 2021
+sentiment_by_party_2022$year <- 2022
+sentiment_by_party_ts <- rbind(sentiment_by_party_2018, sentiment_by_party_2019, sentiment_by_party_2020, sentiment_by_party_2021, sentiment_by_party_2022)
+```
+
+```{r,fig.width=10}
+sentiment_by_party_ts
+ggplot(sentiment_by_party_ts, aes(x = year, y = avg, fill = party)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Average Sentiment of Tweets of U.S. Congress Members, by Party and Year, 2018-2022", x = "Year", y = "Average Sentiment Score", fill = "Party") +
+  scale_fill_manual(values = c(D_HEX, R_HEX, NA_HEX), labels = c("Democratic", "Republican", "Independent")) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+While the sentiment of tweets of Democratic members has been increasing from 2018 to 2022, the converse is true for Republican members. This suggests that Democratic members have become more positive in their tweets over time, while Republican members have become less positive. Surprisingly, the sentiment of tweets of independent members turned out to be the most positive in 2022 after reaching a low in 2020. But this could be due to the small sample size of independent members.
+
+## Sentiment Analysis by Chamber and Year
+
+Now, we will run the same analysis but by chamber of the author.
+
+```{r}
+sentiment_by_chamber <- dbGetQuery(con, "SELECT chamber, AVG(sentiment_score) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id GROUP BY chamber")
+```
+
+```{r,fig.width=10}
+sentiment_by_chamber
+ggplot(sentiment_by_chamber, aes(x = chamber, y = avg)) +
+  geom_col(fill = c(HOUSE_HEX, SENATE_HEX)) +
+  labs(title = "Average Sentiment of Tweets of U.S. Congress Members, by Chamber, 2017-2023", x = "Chamber", y = "Average Sentiment Score") +
+  scale_x_discrete(labels = c("House", "Senate")) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+```{r}
+sentiment_by_chamber_2018 <- dbGetQuery(con, "SELECT chamber, AVG(sentiment_score) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2018-01-01' AND time < '2019-01-01' GROUP BY chamber")
+sentiment_by_chamber_2019 <- dbGetQuery(con, "SELECT chamber, AVG(sentiment_score) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2019-01-01' AND time < '2020-01-01' GROUP BY chamber")
+sentiment_by_chamber_2020 <- dbGetQuery(con, "SELECT chamber, AVG(sentiment_score) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2020-01-01' AND time < '2021-01-01' GROUP BY chamber")
+sentiment_by_chamber_2021 <- dbGetQuery(con, "SELECT chamber, AVG(sentiment_score) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2021-01-01' AND time < '2022-01-01' GROUP BY chamber")
+sentiment_by_chamber_2022 <- dbGetQuery(con, "SELECT chamber, AVG(sentiment_score) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE time >= '2022-01-01' AND time < '2023-01-01' GROUP BY chamber")
+sentiment_by_chamber_2018$year <- 2018
+sentiment_by_chamber_2019$year <- 2019
+sentiment_by_chamber_2020$year <- 2020
+sentiment_by_chamber_2021$year <- 2021
+sentiment_by_chamber_2022$year <- 2022
+sentiment_by_chamber_ts <- rbind(sentiment_by_chamber_2018, sentiment_by_chamber_2019, sentiment_by_chamber_2020, sentiment_by_chamber_2021, sentiment_by_chamber_2022)
+```
+
+```{r,fig.width=10}
+sentiment_by_chamber_ts
+ggplot(sentiment_by_chamber_ts, aes(x = year, y = avg, fill = chamber)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Average Sentiment of Tweets of U.S. Congress Members, by Chamber and Year, 2018-2022", x = "Year", y = "Average Sentiment Score", fill = "Chamber") +
+  scale_fill_manual(values = c(HOUSE_HEX, SENATE_HEX), labels = c("House", "Senate")) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+Senate members have a slightly higher average sentiment score than Senate members in each year. Apart from that, the sentiment of tweets of both chambers has been relatively stable from 2018 to 2022, with a slight decrease in 2022 for both chambers, and a slight increase in 2020 for the Senate. This suggests that the sentiment of tweets of Congress members has been generally positive.
+
+## Sentiment Analysis by Topic and Party
+
+ML topic inference is something that is not covered in this project. I will improve this part in the future. However, we can still analyze the sentiment of tweets by party and topic through tokens extracted from text mining.
+
+```{r}
+sentiment_by_topic <- dbGetQuery(con, "SELECT party, topic, AVG(sentiment_score) FROM (SELECT unnest(tokens) AS topic, sentiment_score, party FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party IS NOT NULL) AS topics WHERE topic LIKE 'vaccine' OR topic LIKE 'lockdown' OR topic LIKE 'climate' OR topic LIKE 'abortion' OR topic LIKE 'gun' OR topic LIKE 'lgbtq' OR topic LIKE 'blm' OR topic LIKE 'gender' OR topic LIKE 'diversity' OR topic LIKE 'immigration' OR topic LIKE 'biden' OR topic LIKE 'trump' GROUP BY party, topic ORDER BY avg DESC")
+```
+
+```{r,fig.width=10}
+sentiment_by_topic
+ggplot(sentiment_by_topic, aes(x = topic, y = avg, fill = party)) +
+  geom_col(position = "dodge") +
+  labs(title = "Average Sentiment of Tweets of U.S. Congress Members, by Topic and Party, 2017-2023", x = "Topic", y = "Average Sentiment Score", fill = "Party", subtitle = "Note: Indepedent members are excluded due to small sample size") +
+  scale_fill_manual(values = c(D_HEX, R_HEX, NA_HEX), labels = c("Democratic", "Republican")) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+From the plot, we can see how Democratic and Republican members have spoken about different current issues. Democratic members have a more positive sentiment when talking about topics such as "vaccine", "abortion", "diversity", "immigration", and "LGBTQ". On the other hand, Republican members have a more positive (or less negative) sentiment when talking about topics such as "Trump", "gun", and "climate". It is interesting to see that Republican members have a more positive sentiment when talking about climate, which is usually a topic that is associated with Democratic members.
+
+This concludes the sentiment analysis.
+
+# Top Accounts Retweeted
+
+Now that we have finished analyzing text data, let's also look at some axillary data. We will start by analyzing the most frequently retweeted accounts by Congress members.
+
+```{r}
+accounts_retweeted_top_30 <- dbGetQuery(con, "SELECT retweeting, COUNT(*) FROM tweets WHERE retweeting IS NOT NULL GROUP BY retweeting ORDER BY count DESC LIMIT 30")
+accounts_retweeted_top_30$rank <- rank(-accounts_retweeted_top_30$count)
+```
+
+```{r,fig.width=10}
+accounts_retweeted_top_30
+ggplot(accounts_retweeted_top_30, aes(x = count, y = reorder(retweeting, count))) +
+  geom_col() +
+  geom_text(aes(label = paste0("#", rank)), hjust = -0.3) +
+  labs(title = "Top 30 Most Frequently Retweeted Accounts by Congress Members, 2017-2023", x = "Number of Retweets", y = "Account") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+The most common accounts retweeted by Congress members are “@HouseGOP, "@realDonaldTrump", "@GOPLeader", "@BillPascrell", "@POTUS", and etc. These accounts are mostly related to the Republican Party, with the exception of "@BillPascrell", who is a Democratic member of the House of Representatives. This suggests that Republican Congress members are more likely to amplify the messages of their party and its leaders by retweeting their accounts, compared to Democratic members.
+
+## Top Accounts Retweeted by Party
+
+Let's also analyze with respect to party.
+
+```{r}
+accounts_retweeted_top_30_d <- dbGetQuery(con, "SELECT retweeting, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND retweeting IS NOT NULL GROUP BY retweeting ORDER BY count DESC LIMIT 30")
+accounts_retweeted_top_30_r <- dbGetQuery(con, "SELECT retweeting, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND retweeting IS NOT NULL GROUP BY retweeting ORDER BY count DESC LIMIT 30")
+accounts_retweeted_top_30_d$party <- "Democrat"
+accounts_retweeted_top_30_d$rank <- rank(-accounts_retweeted_top_30_d$count)
+accounts_retweeted_top_30_r$party <- "Republican"
+accounts_retweeted_top_30_r$rank <- rank(-accounts_retweeted_top_30_r$count)
+accounts_retweeted_top_30_by_party <- rbind(accounts_retweeted_top_30_d, accounts_retweeted_top_30_r)
+```
+
+```{r,fig.width=10}
+accounts_retweeted_top_30_by_party
+ggplot(accounts_retweeted_top_30_by_party, aes(x = count, y = reorder_within(retweeting, count, party))) +
+  geom_col(aes(fill = party)) +
+  geom_text(aes(label = paste0("#", rank)), hjust = c(1.3, rep(-0.3, 29), 1.3, rep(-0.3, 29))) +
+  facet_wrap(~party, scales = "free") +
+  labs(title = "Top 30 Most Frequently Retweeted Accounts by Congress Members, by Party, 2017-2023", x = "Number of Retweets", y = "Account") +
+  scale_fill_manual(values = c(D_HEX, R_HEX)) +
+  scale_y_reordered(labels = function(x) gsub("___.*", "", x)) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The most common accounts retweeted by Democratic members are “@BillPascrell", "@POTUS", "@HouseDemocrats", "@HispanicCaucus", "@SpeakerPelosi", and etc. Meanwhile, the most common accounts retweeted by Republican members are “@HouseGOP", "@realDonaldTrump", "@GOPLeader", "@FoxNews", "@WaysandMeansGOP", and etc. We can see that both parties are retweeting accounts that are organizations or individuals affiliated with their party, such as the House Democrats and House GOP. However, Republican members are more likely to retweet conservative news outlets such as Fox News and Newsmax, and accounts affiliated with former president Donald Trump, such as Donald Trump himself and his son Donald Trump Jr. This suggests that Republican members are more enthusiastic about its leaders, as well as conservative media outlets. On the other hand, Democratic members draw more attention on different caucuses and communities.
+
+## Top Accounts Quoted
+
+Next, we will analyze the most frequently quoted accounts by Congress members.
+
+```{r}
+accounts_quoted_top_30 <- dbGetQuery(con, "SELECT quoting, COUNT(*) FROM tweets WHERE quoting IS NOT NULL GROUP BY quoting ORDER BY count DESC LIMIT 30")
+accounts_quoted_top_30$rank <- rank(-accounts_quoted_top_30$count)
+```
+
+```{r,fig.width=10}
+accounts_quoted_top_30
+ggplot(accounts_quoted_top_30, aes(x = count, y = reorder(quoting, count))) +
+  geom_col() +
+  geom_text(aes(label = paste0("#", rank)), hjust = -0.3) +
+  labs(title = "Top 30 Most Frequently Quoted Accounts by Congress Members, 2017-2023", x = "Number of Quote Tweets", y = "Account") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+## Top Accounts Quoted by Party
+
+Let's also analyze with respect to party.
+
+```{r}
+accounts_quoted_top_30_d <- dbGetQuery(con, "SELECT quoting, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D' AND quoting IS NOT NULL GROUP BY quoting ORDER BY count DESC LIMIT 30")
+accounts_quoted_top_30_r <- dbGetQuery(con, "SELECT quoting, COUNT(*) FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R' AND quoting IS NOT NULL GROUP BY quoting ORDER BY count DESC LIMIT 30")
+accounts_quoted_top_30_d$party <- "Democrat"
+accounts_quoted_top_30_d$rank <- rank(-accounts_quoted_top_30_d$count)
+accounts_quoted_top_30_r$party <- "Republican"
+accounts_quoted_top_30_r$rank <- rank(-accounts_quoted_top_30_r$count)
+accounts_quoted_top_30_by_party <- rbind(accounts_quoted_top_30_d, accounts_quoted_top_30_r)
+```
+
+```{r,fig.width=10}
+accounts_quoted_top_30_by_party
+ggplot(accounts_quoted_top_30_by_party, aes(x = count, y = reorder_within(quoting, count, party))) +
+  geom_col(aes(fill = party)) +
+  geom_text(aes(label = paste0("#", rank)), hjust = c(1.3, rep(-0.3, 29), 1.3, rep(-0.3, 29))) +
+  facet_wrap(~party, scales = "free") +
+  labs(title = "Top 30 Most Frequently Quoted Accounts by Congress Members, by Party, 2017-2023", x = "Number of Quote Tweets", y = "Account") +
+  scale_fill_manual(values = c(D_HEX, R_HEX)) +
+  scale_y_reordered(labels = function(x) gsub("___.*", "", x)) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Top Accounts Mentioned
+
+Lastly, we will analyze the most common accounts mentioned by Congress members in tweets.
+
+```{r}
+accounts_mentioned_top_30 <- dbGetQuery(con, "SELECT mention, COUNT(*) FROM (SELECT UNNEST(mentions) AS mention FROM tweets) AS mentions GROUP BY mention ORDER BY count DESC LIMIT 30")
+accounts_mentioned_top_30$rank <- rank(-accounts_mentioned_top_30$count)
+```
+
+```{r,fig.width=10}
+accounts_mentioned_top_30
+ggplot(accounts_mentioned_top_30, aes(x = count, y = reorder(mention, count))) +
+  geom_col() +
+  geom_text(aes(label = paste0("#", rank)), hjust = -0.3) +
+  labs(title = "Top 30 Most Frequently Mentioned Accounts by Congress Members in Tweets, 2017-2023", x = "Number of Mentions", y = "Account") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+## Top Accounts Mentioned by Party
+
+Let's also analyze with respect to party.
+
+```{r}
+accounts_mentioned_top_30_d <- dbGetQuery(con, "SELECT mention, COUNT(*) FROM (SELECT UNNEST(mentions) AS mention FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'D') AS mentions GROUP BY mention ORDER BY count DESC LIMIT 30")
+accounts_mentioned_top_30_r <- dbGetQuery(con, "SELECT mention, COUNT(*) FROM (SELECT UNNEST(mentions) AS mention FROM tweets JOIN accounts ON tweets.account_id = accounts.id JOIN members ON accounts.member_id = members.id WHERE party = 'R') AS mentions GROUP BY mention ORDER BY count DESC LIMIT 30")
+accounts_mentioned_top_30_d$party <- "Democrat"
+accounts_mentioned_top_30_d$rank <- rank(-accounts_mentioned_top_30_d$count)
+accounts_mentioned_top_30_r$party <- "Republican"
+accounts_mentioned_top_30_r$rank <- rank(-accounts_mentioned_top_30_r$count)
+accounts_mentioned_top_30_by_party <- rbind(accounts_mentioned_top_30_d, accounts_mentioned_top_30_r)
+```
+
+```{r,fig.width=10}
+accounts_mentioned_top_30_by_party
+ggplot(accounts_mentioned_top_30_by_party, aes(x = count, y = reorder_within(mention, count, party))) +
+  geom_col(aes(fill = party)) +
+  geom_text(aes(label = paste0("#", rank)), hjust = -0.3) +
+  facet_wrap(~party, scales = "free_y") +
+  labs(title = "Top 30 Most Frequently Mentioned Accounts by Congress Members in Tweets, by Party, 2017-2023", x = "Number of Mentions", y = "Account") +
+  scale_fill_manual(values = c(D_HEX, R_HEX)) +
+  scale_x_continuous(labels = scales::comma, limits = c(NA, max(as.integer(accounts_mentioned_top_30_by_party$count)) * 1.05)) +
+  scale_y_reordered(labels = function(x) gsub("___.*", "", x)) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+# Conclusion
+
+In this analysis, we have explored the tweets of U.S. Congress members from 2017 to 2023. We have analyzed the sentiment of tweets by different metrics, and identified the most common words, hashtags, and accounts mentioned in tweets. Here are some key takeaways from our analysis:
+
+- Democratic Congress members tweeted more frequently than Republican members.
+- Republican began tweeting more after 2020, catching up with the Democrats.
+- Senators tweeted more frequently than House members if we consider the number of tweets per member.
+
+- The top tweeters were mostly the same throughout the years, suggesting there are some members who are consistently active on Twitter.
+
+- Democratic members have used hashtags related to healthcare, climate change, and gun control, while Republican members have used hashtags related to the border, tax cuts, and the economy.
+- The hashtags of Democratic members transitioned from focusing on healthcare, equality, and climate change in 2018 to focusing on the pandemic, gun violence, and social justice in 2022.
+- The hashtags of Republican members transitioned from focusing on the border and tax reform in 2018 to focusing on the pandemic, border, and international escalations in 2022.
+
+- The word "trump" was the most common words used by Congress members, suggesting that the former president Donald Trump was a major topic of discussion among Congress members.
+- Hashtags by Democratic members are more policy-oriented, while hashtags by Republican members are more event-oriented.
+- The top words for Democratic members were related to healthcare, rights, and communities, while the top words for Republican members were related to the border, tax cuts, and the economy.
+- The top words for Democratic members have been consistent over the years, while the top words for Republican members have evolved, likely reacting to developments in various issues such as inflation, and energy crisis.
+- Senators mentioned "bipartisan" more frequently than House members, suggesting that Senate members are more likely to discuss bipartisan issues and cooperation in their tweets.
+
+- The sentiment of tweets of Congress members has been generally positive from 2018 to 2022.
+- Democratic members have become more positive in their tweets over time, while Republican members have become less positive.
+- Senators were slightly more positive than House members in their tweets.
+- Democratic members have a more positive sentiment when talking about topics such as "vaccine", "abortion", "diversity", "immigration", and "LGBTQ", while Republican members have a more positive sentiment when talking about topics such as "Trump", "gun", and "climate".
+
+- Democratic members like to retweet different caucuses and communities.
+- Republican members like to retweet its leaders, as well as conservative media outlets.
+
+Overall, our analysis has provided valuable insights into the communication strategies and priorities of U.S. Congress members on Twitter. We hope that this analysis will help shed light on the dynamics of political discourse on social media and inform future research on the topic.
+
+If you have any questions or feedback, or want to build on this analysis, please feel free to create pull requests or issues on the [GitHub repository](https://github.com/kennethkn/congresstweets-analysis). Thank you for reading!
+
+# MAJOR THANKS AND CREDITS TO THE CONGRESSTWEETS DATASET BY ALEXLITEL: https://github.com/alexlitel/congresstweets
