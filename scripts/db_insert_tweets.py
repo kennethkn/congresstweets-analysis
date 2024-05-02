@@ -52,7 +52,7 @@ with Session(engine) as session:
                     added_ids.add(tweet_data["id"])
                 except Exception as e:
                     logger.error(f"Error loading tweet: {e}")
-                    error_logs.add((j, e))
+                    error_logs[j] = e
                     errors += 1
                     continue
             logger.info(f"Loaded {(loaded:=len(data)-skipped-errors)} tweets from {j}, skipped {skipped} tweets (posted by non-member accounts or are duplicates), encountered {errors} error(s)")
