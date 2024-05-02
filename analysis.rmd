@@ -919,7 +919,7 @@ In this analysis, we have explored the tweets of U.S. Congress members from 2017
 - Democratic members like to retweet different caucuses and communities.
 - Republican members like to retweet its leaders, as well as conservative media outlets.
 
-Overall, this analysis has provided valuable insights into the communication strategies and priorities of U.S. Congress members on Twitter. I hope that this analysis will help shed light on the dynamics of political discourse on social media and inform future research on the topic.
+Overall, the analysis has provided valuable insights into the communication strategies and priorities of U.S. Congress members on Twitter. I hope that this analysis will help shed light on the dynamics of political discourse on social media and inform future research on the topic.
 
 If you have any questions or feedback, or want to build on this analysis, please feel free to create pull requests or issues on the [GitHub repository](https://github.com/kennethkn/congresstweets-analysis). Thank you for reading!
 
