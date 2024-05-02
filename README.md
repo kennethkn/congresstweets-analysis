@@ -1,6 +1,6 @@
 # congresstweets-analysis
 
-Analysing the tweets of U.S. congress members in relation to political affiliation and current issues, by considering the sentiment, frequency, and trends of related statements to understand the priorities and features of the two parties.
+Analysing the tweets of U.S. congress members (2017-2023) in relation to political affiliation and current issues, by considering the sentiment, frequency, and trends of related statements to understand the priorities and features of the two parties.
 
 Link to Analysis: https://html-preview.github.io/?url=https://github.com/kennethkn/congresstweets-analysis/blob/main/analysis.html
 
@@ -25,7 +25,7 @@ The dataset available for this project is from the GitHub repository [congresstw
 
 ## Methodology
 
-Given the enormous size of the dataset (~4M entries), I have chosen a database approach to store and query the data. The database is hosted locally on my computer via PostgresSQL, but you can reproduce the database by executing Python scripts in the `scripts` folder, which holds scripts for database construction as well as text mining.
+The data used in this analysis is a collection of tweets from U.S. Congress members, available on GitHub at https://github.com/alexlitel/congresstweets. Given the enormous size of the dataset (~4M entries), I have chosen a database approach to store and query the data. The database is hosted locally on my computer via PostgresSQL, but you can reproduce the database by executing Python scripts in the `scripts` folder, which holds scripts for database construction as well as text mining.
 
 1. Ready PostgreSQL server (`brew install postgresql && brew services start postgresql` if you are using macOS)
 2. Create a database named `congresstweets` (`createdb congresstweets`)
