@@ -2,7 +2,7 @@
 
 Analysing the tweets of U.S. congress members in relation to political affiliation and current issues, by considering the sentiment, frequency, and trends of related statements to understand the priorities and features of the two parties.
 
-Link to Analysis: <https://kennethkn.github.io/congresstweets-analysis/analysis.html>
+Link to Analysis: https://html-preview.github.io/?url=https://github.com/kennethkn/congresstweets-analysis/blob/main/analysis.html
 
 ## Project Description
 
